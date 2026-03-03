@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useMemo, useState } from "react";
 import { DAYS, slots, type Slot } from "@/lib/schedule";
 
 const statusStyles: Record<Slot["status"], string> = {
@@ -19,6 +20,19 @@ const statusLabels: Record<Slot["status"], string> = {
 interface WeeklyScheduleProps {
   room: Slot["room"];
   title?: string;
+  weekStart: Date;
+}
+
+interface ReservationItem {
+  id: string;
+  room: Slot["room"];
+  date: string;
+  day: (typeof DAYS)[number];
+  start: string;
+  end: string;
+  subject: string;
+  grade: string;
+  reservedBy: string;
 }
 
 const BLOCK_COLORS = [
@@ -54,23 +68,95 @@ function formatRange(start: string, end: string): string {
   return `${start}/${end}`;
 }
 
+function addDays(base: Date, amount: number): Date {
+  const next = new Date(base);
+  next.setDate(next.getDate() + amount);
+  return next;
+}
+
+function toIsoDate(value: Date): string {
+  return value.toISOString().split("T")[0];
+}
+
+function formatDateLabel(date: Date): string {
+  return new Intl.DateTimeFormat("es-CO", {
+    day: "numeric",
+    month: "short",
+  }).format(date);
+}
+
 function getFixedColor(course: string): string {
   const hash = Array.from(course).reduce((acc, char) => acc + (char.codePointAt(0) ?? 0), 0);
   return BLOCK_COLORS[hash % BLOCK_COLORS.length];
 }
 
-function getSlotClass(slot: Slot): string {
-  if (slot.status === "fixed") {
-    return `${getFixedColor(slot.course)} border-zinc-500`;
-  }
+export function WeeklySchedule({ room, title, weekStart }: Readonly<WeeklyScheduleProps>) {
+  const [reservations, setReservations] = useState<ReservationItem[]>([]);
+  const [loadingReservations, setLoadingReservations] = useState(false);
+  const [reservationsError, setReservationsError] = useState("");
 
-  return statusStyles[slot.status];
-}
+  const roomSlots = useMemo(
+    () =>
+      slots
+        .filter((slot) => slot.room === room)
+        .sort((a, b) => toMinutes(a.start) - toMinutes(b.start)),
+    [room],
+  );
+  const weekDays = DAYS.map((day, index) => {
+    const date = addDays(weekStart, index);
+    return {
+      day,
+      dateIso: toIsoDate(date),
+      dateLabel: formatDateLabel(date),
+    };
+  });
+  const startDate = weekDays[0]?.dateIso;
+  const endDate = weekDays.at(-1)?.dateIso;
 
-export function WeeklySchedule({ room, title }: Readonly<WeeklyScheduleProps>) {
-  const roomSlots = slots
-    .filter((slot) => slot.room === room)
-    .sort((a, b) => toMinutes(a.start) - toMinutes(b.start));
+  useEffect(() => {
+    const controller = new AbortController();
+    async function fetchReservations() {
+      if (!startDate || !endDate) {
+        return;
+      }
+
+      setLoadingReservations(true);
+      setReservationsError("");
+      try {
+        const params = new URLSearchParams({
+          room,
+          startDate,
+          endDate,
+        });
+        const response = await fetch(`/api/reservations?${params.toString()}`, {
+          method: "GET",
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        const payload = (await response.json()) as {
+          data?: ReservationItem[];
+          error?: { message?: string };
+        };
+
+        if (!response.ok) {
+          setReservationsError(payload.error?.message ?? "No fue posible cargar reservas.");
+          return;
+        }
+
+        setReservations(payload.data ?? []);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
+        setReservationsError("No fue posible cargar reservas.");
+      } finally {
+        setLoadingReservations(false);
+      }
+    }
+
+    void fetchReservations();
+    return () => controller.abort();
+  }, [room, startDate, endDate]);
 
   const minStart = Math.min(...roomSlots.map((slot) => toMinutes(slot.start)));
   const maxEnd = Math.max(...roomSlots.map((slot) => toMinutes(slot.end)));
@@ -93,25 +179,54 @@ export function WeeklySchedule({ room, title }: Readonly<WeeklyScheduleProps>) {
           ))}
         </div>
       </div>
+      {loadingReservations && <p className="text-sm text-slate-600">Cargando reservas...</p>}
+      {reservationsError && <p className="text-sm text-red-700">{reservationsError}</p>}
 
       <div className="overflow-x-auto rounded-lg border border-[#d8b7c0] bg-white shadow-sm">
         <table className="min-w-[1000px] w-full border-collapse text-sm">
           <thead>
             <tr className="bg-[#f8e8ed]">
-              {DAYS.map((day) => (
-                <th key={day} className="border border-[#d8b7c0] p-2 text-center text-[#8f1530]">
-                  {day}
+              {weekDays.map((item) => (
+                <th key={item.dateIso} className="border border-[#d8b7c0] p-2 text-center text-[#8f1530]">
+                  <p>{item.day}</p>
+                  <p className="text-xs font-normal text-slate-600">{item.dateLabel}</p>
                 </th>
               ))}
             </tr>
           </thead>
           <tbody>
             <tr>
-              {DAYS.map((day) => {
-                const daySlots = roomSlots.filter((slot) => slot.day === day);
+              {weekDays.map((item) => {
+                const fixedBlocks = roomSlots
+                  .filter((slot) => slot.day === item.day)
+                  .map((slot) => ({
+                    id: slot.id,
+                    start: slot.start,
+                    end: slot.end,
+                    subject: slot.subject,
+                    grade: slot.course,
+                    teacher: slot.teacher,
+                    status: "fixed" as Slot["status"],
+                  }));
+
+                const reservedBlocks = reservations
+                  .filter((reservation) => reservation.date === item.dateIso)
+                  .map((reservation) => ({
+                    id: reservation.id,
+                    start: reservation.start,
+                    end: reservation.end,
+                    subject: reservation.subject,
+                    grade: reservation.grade,
+                    teacher: reservation.reservedBy,
+                    status: "reserved" as Slot["status"],
+                  }));
+
+                const daySlots = [...fixedBlocks, ...reservedBlocks].sort(
+                  (a, b) => toMinutes(a.start) - toMinutes(b.start),
+                );
 
                 return (
-                  <td key={day} className="border border-[#d8b7c0] bg-white align-top">
+                  <td key={item.dateIso} className="border border-[#d8b7c0] bg-white align-top">
                     <div className="relative" style={{ height: `${TIMELINE_HEIGHT}px` }}>
                       {daySlots.map((slot) => {
                         const start = toMinutes(slot.start);
@@ -127,9 +242,13 @@ export function WeeklySchedule({ room, title }: Readonly<WeeklyScheduleProps>) {
                         return (
                           <article
                             key={slot.id}
-                            className={`absolute left-0 right-0 m-0.5 overflow-hidden rounded border p-1.5 ${getSlotClass(slot)}`}
+                            className={`absolute left-0 right-0 m-0.5 overflow-hidden rounded border p-1.5 ${
+                              slot.status === "fixed"
+                                ? `${getFixedColor(slot.grade)} border-zinc-500`
+                                : statusStyles[slot.status]
+                            }`}
                             style={{ top: `${top}px`, height: `${height}px` }}
-                            title={`${slot.subject} - ${slot.course} - ${slot.teacher} (${slot.start}-${slot.end})`}
+                            title={`${slot.subject} - ${slot.grade} - ${slot.teacher} (${slot.start}-${slot.end})`}
                           >
                             <p className="text-[11px] leading-none text-right text-slate-700">
                               {formatRange(slot.start, slot.end)}
@@ -141,7 +260,7 @@ export function WeeklySchedule({ room, title }: Readonly<WeeklyScheduleProps>) {
                             >
                               {slot.subject}
                             </p>
-                            {!isTinyBlock && <p className="truncate text-xs font-medium text-slate-800">{slot.course}</p>}
+                            {!isTinyBlock && <p className="truncate text-xs font-medium text-slate-800">{slot.grade}</p>}
                             {!isCompactBlock && <p className="truncate text-[10px] leading-tight text-slate-700">{slot.teacher}</p>}
                           </article>
                         );

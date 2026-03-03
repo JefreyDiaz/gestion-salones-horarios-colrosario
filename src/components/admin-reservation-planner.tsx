@@ -1,11 +1,11 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { DAYS, ROOMS, slots, type Day, type Slot } from "@/lib/schedule";
 
 type ReserveMode = "full" | "custom";
 
-interface ManualReservation {
+interface Reservation {
   id: string;
   room: Slot["room"];
   date: string;
@@ -22,6 +22,13 @@ interface FreeSegment {
   day: Day;
   start: string;
   end: string;
+}
+
+interface ApiErrorResponse {
+  error?: {
+    code?: string;
+    message?: string;
+  };
 }
 
 const TIMELINE_HEIGHT = 620;
@@ -64,10 +71,22 @@ function formatDateLabel(date: Date): string {
   }).format(date);
 }
 
+function getErrorMessage(fallback: string, payload: unknown): string {
+  if (
+    typeof payload === "object" &&
+    payload !== null &&
+    "error" in payload &&
+    typeof (payload as ApiErrorResponse).error?.message === "string"
+  ) {
+    return (payload as ApiErrorResponse).error?.message ?? fallback;
+  }
+  return fallback;
+}
+
 export function AdminReservationPlanner() {
   const [selectedRoom, setSelectedRoom] = useState<Slot["room"]>(ROOMS[0]);
   const [weekStart, setWeekStart] = useState<Date>(getStartOfWeekMonday(new Date()));
-  const [reservations, setReservations] = useState<ManualReservation[]>([]);
+  const [reservations, setReservations] = useState<Reservation[]>([]);
   const [activeSegment, setActiveSegment] = useState<FreeSegment | null>(null);
   const [reserveMode, setReserveMode] = useState<ReserveMode>("full");
   const [reservedBy, setReservedBy] = useState("");
@@ -75,7 +94,13 @@ export function AdminReservationPlanner() {
   const [grade, setGrade] = useState("");
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd] = useState("");
+  const [loadingReservations, setLoadingReservations] = useState(false);
+  const [savingReservation, setSavingReservation] = useState(false);
+  const [deletingReservationId, setDeletingReservationId] = useState<string | null>(null);
+  const [pageError, setPageError] = useState("");
   const [formError, setFormError] = useState("");
+  const [deleteError, setDeleteError] = useState("");
+  const [reservationToDelete, setReservationToDelete] = useState<Reservation | null>(null);
 
   const weekDays = useMemo(
     () =>
@@ -101,6 +126,56 @@ export function AdminReservationPlanner() {
   );
   const totalMinutes = maxEnd - minStart + MINUTES_GUTTER;
 
+  useEffect(() => {
+    const controller = new AbortController();
+    const startDate = weekDays[0]?.dateIso;
+    const endDate = weekDays.at(-1)?.dateIso;
+
+    async function fetchReservations() {
+      if (!startDate || !endDate) {
+        return;
+      }
+      setLoadingReservations(true);
+      setPageError("");
+
+      const params = new URLSearchParams({
+        room: selectedRoom,
+        startDate,
+        endDate,
+      });
+
+      try {
+        const response = await fetch(`/api/reservations?${params.toString()}`, {
+          method: "GET",
+          signal: controller.signal,
+          cache: "no-store",
+        });
+
+        const payload = (await response.json()) as {
+          data?: Reservation[];
+          error?: { message?: string };
+        };
+
+        if (!response.ok) {
+          setPageError(getErrorMessage("No fue posible cargar reservas.", payload));
+          return;
+        }
+
+        setReservations(payload.data ?? []);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
+        setPageError("No fue posible cargar reservas.");
+      } finally {
+        setLoadingReservations(false);
+      }
+    }
+
+    void fetchReservations();
+    return () => controller.abort();
+  }, [selectedRoom, weekDays]);
+
   function closeModal(): void {
     setActiveSegment(null);
     setReserveMode("full");
@@ -120,7 +195,20 @@ export function AdminReservationPlanner() {
     setFormError("");
   }
 
-  function createReservation(): void {
+  function openDeleteModal(reservation: Reservation): void {
+    setReservationToDelete(reservation);
+    setDeleteError("");
+  }
+
+  function closeDeleteModal(): void {
+    if (deletingReservationId) {
+      return;
+    }
+    setReservationToDelete(null);
+    setDeleteError("");
+  }
+
+  async function createReservation(): Promise<void> {
     if (!activeSegment) return;
 
     if (!reservedBy.trim() || !subject.trim() || !grade.trim()) {
@@ -151,20 +239,88 @@ export function AdminReservationPlanner() {
       return;
     }
 
-    const reservation: ManualReservation = {
-      id: `r-${Date.now()}`,
-      room: selectedRoom,
-      date: activeSegment.date,
-      day: activeSegment.day,
-      start,
-      end,
-      reservedBy: reservedBy.trim(),
-      subject: subject.trim(),
-      grade: grade.trim(),
-    };
+    setSavingReservation(true);
+    setFormError("");
+    setPageError("");
 
-    setReservations((previous) => [...previous, reservation]);
-    closeModal();
+    try {
+      const response = await fetch("/api/reservations", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          room: selectedRoom,
+          date: activeSegment.date,
+          day: activeSegment.day,
+          start,
+          end,
+          reservedBy: reservedBy.trim(),
+          subject: subject.trim(),
+          grade: grade.trim(),
+        }),
+      });
+
+      const payload = (await response.json()) as {
+        data?: Reservation;
+        error?: { message?: string };
+      };
+
+      if (!response.ok) {
+        setFormError(getErrorMessage("No fue posible guardar la reserva.", payload));
+        return;
+      }
+
+      const createdReservation = payload.data;
+      if (createdReservation) {
+        setReservations((previous) =>
+          [...previous, createdReservation].sort((a, b) => {
+            if (a.date !== b.date) return a.date.localeCompare(b.date);
+            return a.start.localeCompare(b.start);
+          }),
+        );
+      }
+      closeModal();
+    } catch {
+      setFormError("No fue posible guardar la reserva.");
+    } finally {
+      setSavingReservation(false);
+    }
+  }
+
+  async function deleteReservation(): Promise<void> {
+    if (!reservationToDelete) {
+      return;
+    }
+
+    setDeletingReservationId(reservationToDelete.id);
+    setDeleteError("");
+    setPageError("");
+
+    try {
+      const params = new URLSearchParams({ id: reservationToDelete.id });
+      const response = await fetch(`/api/reservations?${params.toString()}`, {
+        method: "DELETE",
+      });
+
+      const payload = (await response.json()) as {
+        data?: { id?: string };
+        error?: { message?: string };
+      };
+
+      if (!response.ok) {
+        setDeleteError(getErrorMessage("No fue posible eliminar la reserva.", payload));
+        return;
+      }
+
+      const deletedId = payload.data?.id ?? reservationToDelete.id;
+      setReservations((previous) => previous.filter((item) => item.id !== deletedId));
+      setReservationToDelete(null);
+    } catch {
+      setDeleteError("No fue posible eliminar la reserva.");
+    } finally {
+      setDeletingReservationId(null);
+    }
   }
 
   return (
@@ -213,6 +369,7 @@ export function AdminReservationPlanner() {
             </button>
           </div>
         </div>
+        {pageError && <p className="mt-3 text-sm text-red-700">{pageError}</p>}
       </div>
 
       <div className="overflow-x-auto rounded-lg border border-[#d8b7c0] bg-white shadow-sm">
@@ -348,20 +505,37 @@ export function AdminReservationPlanner() {
 
       <div className="brand-card rounded-lg p-4 shadow-sm">
         <h3 className="brand-title text-lg font-semibold">Reservas creadas en esta semana</h3>
-        <ul className="mt-3 space-y-2 text-sm">
-          {reservations.filter((reservation) => reservation.room === selectedRoom).length === 0 ? (
-            <li className="brand-copy">Aun no hay reservas manuales para este salon.</li>
-          ) : (
-            reservations
-              .filter((reservation) => reservation.room === selectedRoom)
-              .map((reservation) => (
-                <li key={reservation.id} className="rounded border border-[#d8b7c0] bg-[#fff7f9] p-2 text-slate-800">
-                  {reservation.day} {reservation.date} - {reservation.start}-{reservation.end} - {reservation.subject} (
-                  {reservation.grade}) - {reservation.reservedBy}
-                </li>
-              ))
-          )}
-        </ul>
+        {loadingReservations ? (
+          <p className="brand-copy mt-3 text-sm">Cargando reservas...</p>
+        ) : (
+          <ul className="mt-3 space-y-2 text-sm">
+            {reservations.filter((reservation) => reservation.room === selectedRoom).length === 0 ? (
+              <li className="brand-copy">Aun no hay reservas manuales para este salon.</li>
+            ) : (
+              reservations
+                .filter((reservation) => reservation.room === selectedRoom)
+                .map((reservation) => (
+                  <li
+                    key={reservation.id}
+                    className="flex items-center justify-between gap-3 rounded border border-[#d8b7c0] bg-[#fff7f9] p-2 text-slate-800"
+                  >
+                    <span>
+                      {reservation.day} {reservation.date} - {reservation.start}-{reservation.end} - {reservation.subject} (
+                      {reservation.grade}) - {reservation.reservedBy}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => openDeleteModal(reservation)}
+                      disabled={deletingReservationId === reservation.id}
+                      className="shrink-0 rounded border border-[#b21a3a] px-2 py-1 text-xs font-medium text-[#8f1530] hover:bg-[#ffe6ec] disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {deletingReservationId === reservation.id ? "Eliminando..." : "Eliminar"}
+                    </button>
+                  </li>
+                ))
+            )}
+          </ul>
+        )}
       </div>
 
       {activeSegment && (
@@ -471,10 +645,44 @@ export function AdminReservationPlanner() {
               </button>
               <button
                 type="button"
-                onClick={createReservation}
-                className="rounded bg-[#b21a3a] px-3 py-2 text-sm font-medium text-white hover:bg-[#8f1530]"
+                onClick={() => void createReservation()}
+                disabled={savingReservation}
+                className="rounded bg-[#b21a3a] px-3 py-2 text-sm font-medium text-white hover:bg-[#8f1530] disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Guardar reserva
+                {savingReservation ? "Guardando..." : "Guardar reserva"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {reservationToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md rounded-lg border border-[#d8b7c0] bg-white p-5 shadow-xl">
+            <h3 className="text-lg font-bold text-[#8f1530]">Confirmar eliminacion</h3>
+            <p className="mt-2 text-sm text-slate-700">
+              Vas a eliminar la reserva de <strong>{reservationToDelete.subject}</strong> ({reservationToDelete.grade})
+              , {reservationToDelete.day} {reservationToDelete.date} de {reservationToDelete.start} a{" "}
+              {reservationToDelete.end}.
+            </p>
+            <p className="text-sm text-slate-700">Esta accion no se puede deshacer.</p>
+            {deleteError && <p className="mt-3 text-sm text-red-700">{deleteError}</p>}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={closeDeleteModal}
+                disabled={Boolean(deletingReservationId)}
+                className="rounded border border-[#d8b7c0] px-3 py-2 text-sm text-slate-700 hover:bg-[#fff7f9] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() => void deleteReservation()}
+                disabled={Boolean(deletingReservationId)}
+                className="rounded bg-[#b21a3a] px-3 py-2 text-sm font-medium text-white hover:bg-[#8f1530] disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {deletingReservationId ? "Eliminando..." : "Si, eliminar"}
               </button>
             </div>
           </div>
